@@ -1,0 +1,8 @@
+/*
+!/src/
+/src/*
+!/src/robot_control
+/src/robot_control/captures/
+/src/robot_control/robot_control/__pycache__/
+!/src/candidate_generation
+!/.gitignore

@@ -1,0 +1,7 @@
+/**:
+  ros__parameters:
+    wrist_yaw: [-1.17, 4.27]
+    wrist_pitch: [-1.57, 0.56]
+    wrist_roll: [-1.17, 4.27]
+    head_pan: [-4.0, 1.7]
+    head_tilt: [-1.57, 0.56]

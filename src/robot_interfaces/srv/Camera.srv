@@ -1,0 +1,5 @@
+float32[] angles
+string[] joints
+---
+bool success
+string message
