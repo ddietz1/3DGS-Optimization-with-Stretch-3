@@ -75,6 +75,43 @@ def unproject_depth_to_points(depth_m: np.ndarray, rgb: np.ndarray, c2w: np.ndar
     return points_world, colors
 
 
+def append_points_to_ply(ply_path: Path, new_points: np.ndarray, new_colors: np.ndarray) -> int:
+    """Appends points to the dataset's point cloud, preserving the ASCII
+    PLY format the bootstrap itself writes below (confirmed plyfile reads
+    and re-writes this exact hand-written format correctly). Creates the
+    file fresh if it doesn't exist yet (e.g. this dataset was originally
+    built without --build-pointcloud).
+
+    Writes ATOMICALLY: to a temp file first, renamed over the real path
+    only once the write fully succeeds. Confirmed necessary, not just
+    theoretical -- an interrupted write (crash/OOM-kill/Ctrl+C mid-write)
+    left a real corrupted sparse_pc.ply in this exact project: the header
+    claimed more vertices than were actually flushed to disk before the
+    process died, since the header (with the final intended count) is
+    written before the vertex data streams out. A partial write under the
+    old direct-write approach destroys the file; under this approach it
+    just fails to update it, leaving the previous good version intact."""
+    from plyfile import PlyData, PlyElement
+    import os
+
+    dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
+    new_vertices = np.empty(len(new_points), dtype=dtype)
+    new_vertices['x'], new_vertices['y'], new_vertices['z'] = new_points.T
+    new_vertices['red'], new_vertices['green'], new_vertices['blue'] = new_colors.T
+
+    if ply_path.exists():
+        existing = PlyData.read(str(ply_path))['vertex'].data
+        combined = np.concatenate([existing, new_vertices])
+    else:
+        combined = new_vertices
+
+    tmp_path = ply_path.with_suffix(ply_path.suffix + ".tmp")
+    PlyData([PlyElement.describe(combined, 'vertex')], text=True).write(str(tmp_path))
+    os.replace(str(tmp_path), str(ply_path))  # atomic on the same filesystem
+    return len(combined)
+
+
 def add_frame_to_dataset(dataset_dir: Path, map_pose_path: Path, session_label: str = None):
     """Adds one new capture to an existing direct-poses dataset, safely.
 
@@ -84,6 +121,15 @@ def add_frame_to_dataset(dataset_dir: Path, map_pose_path: Path, session_label: 
     waypoint/pose numbering resets per session, so identically-named files
     from different sessions are entirely possible. Refuses to silently
     overwrite an existing file with the same target name.
+
+    Also seeds the dataset's point cloud with this capture's depth-
+    unprojected points, using the SAME unproject_depth_to_points already
+    used at bootstrap time -- previously, incorporation gave new Gaussians
+    zero explicit geometric anchor, relying entirely on whatever multi-view
+    support happened to already exist nearby for that region. Silently
+    skips seeding (still incorporates the frame normally) if no depth file
+    is found for this capture, since not every capture is guaranteed to
+    have one.
     """
     dataset_dir = Path(dataset_dir)
     map_pose_path = Path(map_pose_path)
@@ -113,6 +159,24 @@ def add_frame_to_dataset(dataset_dir: Path, map_pose_path: Path, session_label: 
     c2w = map_pose_to_nerfstudio_c2w(map_pose_path)
     shutil.copy(rgb_path, dest_path)
     meta["frames"].append({"file_path": target_file_path, "transform_matrix": c2w.tolist()})
+
+    depth_path = map_pose_path.with_name(f"{base}_depth.npy")
+    if depth_path.exists():
+        from PIL import Image
+        depth_m = load_raw_depth(depth_path, target_hw=(meta["h"], meta["w"]))
+        rgb_img = np.array(Image.open(rgb_path).convert("RGB").resize((meta["w"], meta["h"])))
+        points_world, colors = unproject_depth_to_points(
+            depth_m, rgb_img, c2w,
+            meta["fl_x"], meta["fl_y"], meta["cx"], meta["cy"],
+        )
+        if len(points_world) > 0:
+            ply_path = dataset_dir / "sparse_pc.ply"
+            total = append_points_to_ply(ply_path, points_world, colors)
+            meta["ply_file_path"] = "sparse_pc.ply"  # set even if this dataset had none before
+            print(f"Added {len(points_world)} depth-seeded points ({total} total in point cloud)")
+    else:
+        print(f"WARNING: no depth file at {depth_path} -- incorporating "
+              f"{target_file_path} WITHOUT point-cloud seeding")
 
     with open(dataset_dir / "transforms.json", "w") as f:
         json.dump(meta, f, indent=2)

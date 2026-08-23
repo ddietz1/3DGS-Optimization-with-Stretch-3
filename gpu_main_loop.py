@@ -10,6 +10,17 @@ Starts gpu_candidate_puller.py running continuously in the background, then:
     robot, wait for the robot to send back a new capture, incorporate it,
     resume-train, check convergence, repeat.
 
+TWO THINGS THIS DEPENDS ON THAT AREN'T BUILT YET (see chat message):
+  1. MoveJoints needs to write a DONE marker file when follow_waypoints()
+     finishes -- this script polls for it. One-line addition needed:
+         open(os.path.join(node.capture_dir, 'DONE'), 'w').close()
+     right after `node.follow_waypoints()` in MoveJoints' main().
+  2. The robot-side "pick a candidate, navigate, capture, done" logic
+     (combining score with travel cost) doesn't exist yet -- this script's
+     wait_for_new_capture() will simply poll indefinitely until something
+     on the robot side actually writes a new capture. That's expected,
+     not a bug in this script.
+
 Checkpointed like run_full_pipeline.py -- state.json tracks whether
 bootstrap is done and which round you're on, so a crash mid-loop resumes
 rather than restarting everything.
@@ -33,6 +44,7 @@ earlier, now actually implemented):
 import argparse
 import atexit
 import json
+import math
 import subprocess
 import sys
 import time
@@ -52,6 +64,12 @@ class State:
             "bootstrap_done": False,
             "last_completed_round": -1,
             "seen_capture_files": [],
+            "points_at_current_checkpoint": None,  # how many points were in
+            # sparse_pc.ply when the CURRENTLY ACTIVE checkpoint was trained --
+            # needed to know which points in the point cloud are genuinely NEW
+            # since that checkpoint, for Gaussian injection. Gaussian count
+            # alone can't answer this (splitting/duplication inflates it
+            # independently of seed point count).
         }
 
     def save(self):
@@ -69,6 +87,30 @@ def run_cmd(cmd: list, log_path: Path, dry_run: bool) -> int:
         f.flush()
         result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
     return result.returncode
+
+
+def get_checkpoint_step(ckpt_dir: Path) -> int:
+    """Parses the current cumulative step count from the latest checkpoint
+    filename (e.g. step-000032999.ckpt -> 32999) -- needed to compute a
+    densification ceiling that's always ahead of where training actually
+    is, rather than a fixed number that silently caps out once enough
+    rounds accumulate past it. Verified against this project's real
+    checkpoint filenames before trusting the parsing."""
+    ckpts = sorted(ckpt_dir.glob("step-*.ckpt"))
+    if not ckpts:
+        raise RuntimeError(f"No checkpoints found in {ckpt_dir}")
+    latest = ckpts[-1].stem  # e.g. "step-000032999"
+    return int(latest.split("-")[-1])
+
+
+def count_ply_points(ply_path: Path) -> int:
+    """Total point count currently in the dataset's point cloud -- used as
+    a baseline to determine which points are genuinely NEW since a given
+    checkpoint was trained."""
+    if not ply_path.exists():
+        return 0
+    from plyfile import PlyData
+    return len(PlyData.read(str(ply_path))['vertex'].data)
 
 
 def find_latest_config(experiment_dir: Path, experiment_name: str) -> Path:
@@ -221,7 +263,26 @@ def pull_capture(robot_run_name: str, base_name: str, local_dir: Path, dry_run: 
             raise RuntimeError(f"Failed to pull {base_name}{suffix}")
 
 
-def merge_candidate_files(candidates_dir: Path, out_path: Path) -> int:
+def load_captured_positions(base_dir: Path, capture_basenames: list) -> list:
+    """Reads the real, achieved camera position (map frame, from
+    motion_control.py's capture_frame() -- NOT the originally-requested
+    candidate pose) for every capture incorporated so far, whether from the
+    bootstrap set (captures_initial) or a loop round (captures_loop). Used
+    by merge_candidate_files() to exclude candidates that have effectively
+    already been observed."""
+    positions = []
+    for base_name in capture_basenames:
+        for subdir in ("captures_initial", "captures_loop"):
+            pose_path = base_dir / subdir / f"{base_name}_map_pose.json"
+            if pose_path.exists():
+                positions.append(json.loads(pose_path.read_text())["position"])
+                break
+    return positions
+
+
+def merge_candidate_files(candidates_dir: Path, out_path: Path,
+                           captured_positions: list = None,
+                           exclusion_radius: float = 0.15) -> int:
     """Merges every candidates_*.json file pulled so far into one combined
     list -- CandidateGenerator only writes ~5 candidates per 30s cycle, so
     scoring only the latest file (the old behavior) throws away everything
@@ -230,7 +291,19 @@ def merge_candidate_files(candidates_dir: Path, out_path: Path) -> int:
     scoring together. Must genuinely re-score the full merged set every
     round, even entries seen before -- the model itself changes between
     rounds (resume-trained), so old scores would be stale against the
-    current checkpoint; there's no valid way to cache them."""
+    current checkpoint; there's no valid way to cache them.
+
+    EXCLUDES candidates within exclusion_radius of any already-captured real
+    camera position. Without this, a candidate near a region that's already
+    been photographed stays in the pool and can keep re-winning if its
+    scored uncertainty hasn't fully resolved yet -- this is a backstop, not
+    a fix for the scoring mechanism itself (see motion_control.py's
+    post-nav position-convergence check, added because Nav2's goal
+    tolerance alone let real captures land ~0.39m from their intended
+    candidate pose). radius default (0.15m) is intentionally a bit larger
+    than that fix's 0.05m nav-convergence threshold, to also cover the
+    residual gap between a candidate's exact position and wherever the
+    D435 actually ends up after standoff navigation + pan/tilt."""
     merged = []
     files = sorted(candidates_dir.glob("candidates_*.json"))
     for f in files:
@@ -238,8 +311,21 @@ def merge_candidate_files(candidates_dir: Path, out_path: Path) -> int:
             merged.extend(json.loads(f.read_text()))
         except (json.JSONDecodeError, OSError) as e:
             print(f"  WARNING: skipping unreadable candidate file {f}: {e}")
+
+    n_excluded = 0
+    if captured_positions:
+        kept = []
+        for c in merged:
+            if any(math.dist(c["position"], cp) <= exclusion_radius
+                   for cp in captured_positions):
+                n_excluded += 1
+            else:
+                kept.append(c)
+        merged = kept
+
     out_path.write_text(json.dumps(merged, indent=2))
-    print(f"Merged {len(files)} candidate files -> {len(merged)} total candidates -> {out_path}")
+    print(f"Merged {len(files)} candidate files -> {len(merged)} candidates "
+          f"({n_excluded} excluded as already-captured within {exclusion_radius}m) -> {out_path}")
     return len(merged)
 
 
@@ -255,7 +341,15 @@ def main():
     ap.add_argument("--cy", type=float, required=True)
     ap.add_argument("--width", type=int, required=True)
     ap.add_argument("--height", type=int, required=True)
-    ap.add_argument("--total-budget", type=int, default=150000)
+    ap.add_argument("--budget-margin", type=int, default=10000,
+                     help="Densification/scheduler ceiling is now computed dynamically "
+                          "each round as current_step + this_call's_iterations + margin, "
+                          "rather than a fixed --total-budget -- a fixed ceiling, however "
+                          "large, silently caps densification once enough rounds "
+                          "accumulate past it (confirmed as the cause of a real render "
+                          "regression: default budget=50000 capped exactly at round 4 "
+                          "given baseline=40000, resume=3000/round). This margin is the "
+                          "safety buffer beyond exactly matching, per training call.")
     ap.add_argument("--baseline-iterations", type=int, default=20000)
     ap.add_argument("--resume-iterations", type=int, default=10000)
     ap.add_argument("--top-n", type=int, default=10)
@@ -270,9 +364,40 @@ def main():
                           "rather than silently mis-incorporating a new capture into a "
                           "COLMAP-frame dataset. Use --stop-after-round 0 with this until "
                           "COLMAP-compatible incorporation is wired in.")
+    ap.add_argument("--full-retrain-every", type=int, default=0,
+                     help="Every Nth round, train FRESH from scratch on the full "
+                          "accumulated dataset instead of resuming from the "
+                          "checkpoint. This is the only way accumulated "
+                          "depth-seeded points in sparse_pc.ply actually reach "
+                          "a live model -- confirmed via nerfstudio source that "
+                          "populate_modules() correctly reads the current point "
+                          "cloud on a fresh start, but --load-dir resume's "
+                          "_load_checkpoint() runs afterward and unconditionally "
+                          "overwrites gauss_params with the checkpoint's own "
+                          "saved (older, smaller) Gaussian set, discarding it. "
+                          "0 disables this (every round resumes, matching prior "
+                          "behavior). Round 0 is never a full retrain regardless "
+                          "of this value -- redundant with bootstrap, which is "
+                          "already a fresh train.")
+    ap.add_argument("--full-retrain-iterations", type=int, default=None,
+                     help="Iterations for a full-retrain round. Defaults to "
+                          "--baseline-iterations if not set, matching the "
+                          "budget the original bootstrap used -- a fresh "
+                          "train from scratch needs comparable budget to "
+                          "reach good quality, not the much shorter "
+                          "--resume-iterations used for incremental rounds.")
     ap.add_argument("--stop-after-round", type=int, default=None,
                      help="Exit cleanly after this many loop rounds, for a "
                           "controlled smoke test instead of running indefinitely")
+    ap.add_argument("--capture-exclusion-radius", type=float, default=0.15,
+                     help="Candidates within this many meters of an already-captured "
+                          "real camera position are dropped from the scoring pool each "
+                          "round (see merge_candidate_files()). STARTING GUESS, not "
+                          "measured: derived from the 0.05m base-position-convergence "
+                          "threshold added in motion_control.py's test_d435_ik, plus "
+                          "rough slack for residual yaw error and standoff/pan-tilt "
+                          "geometry -- re-tune from real candidate-vs-achieved-capture-"
+                          "position gaps once the position fix has been run for real.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -341,12 +466,16 @@ def main():
             if rc != 0:
                 raise RuntimeError("colmap_map_align.py bulk-apply failed")
 
+        # Starting from step 0, so this round's ceiling is simply this
+        # call's own iteration count plus margin -- same dynamic principle
+        # as the resume rounds below, just with no prior checkpoint to read.
+        bootstrap_budget = args.baseline_iterations + args.budget_margin
         rc = run_cmd(
             [sys.executable, str(Path(__file__).parent / "ns_train_patched.py"), "splatfacto",
              "--data", str(dataset_dir), "--experiment-name", experiment_name,
              "--output-dir", str(base_dir), "--max-num-iterations", str(args.baseline_iterations),
-             "--pipeline.model.stop-split-at", str(args.total_budget),
-             "--optimizers.means.scheduler.max-steps", str(args.total_budget),
+             "--pipeline.model.stop-split-at", str(bootstrap_budget),
+             "--optimizers.means.scheduler.max-steps", str(bootstrap_budget),
              "--vis", "viewer", "--viewer.quit-on-train-completion", "True"] + frozen_dataparser_flags(),
             base_dir / "logs" / "train_initial.log", args.dry_run,
         )
@@ -359,6 +488,8 @@ def main():
                 p.name.replace("_map_pose.json", "")
                 for p in initial_captures_dir.glob("*_map_pose.json")
             )
+            if args.pose_source == "direct":
+                state.data["points_at_current_checkpoint"] = count_ply_points(dataset_dir / "sparse_pc.ply")
             state.save()
         print("=== Bootstrap complete ===\n")
 
@@ -389,7 +520,10 @@ def main():
                 time.sleep(args.poll_interval)
                 continue
             candidates_file = round_dir / "merged_candidates.json"
-            merge_candidate_files(candidates_dir, candidates_file)
+            captured_positions = load_captured_positions(base_dir, state.data["seen_capture_files"])
+            merge_candidate_files(candidates_dir, candidates_file,
+                                   captured_positions=captured_positions,
+                                   exclusion_radius=args.capture_exclusion_radius)
 
         rc = run_cmd(
             [sys.executable, str(Path(__file__).parent / "score_and_return_top_candidates.py"),
@@ -416,6 +550,18 @@ def main():
         seen = set(state.data["seen_capture_files"])
         new_capture_bases = wait_for_new_captures(args.robot_run_name, seen, args.poll_interval, args.dry_run)
 
+        if not args.dry_run:
+            # Records exactly which captures belong to THIS round, plus which
+            # checkpoint was current before this round's training -- needed
+            # to later render "this round's own newly-captured pose, before
+            # vs after THIS round's training" rather than an arbitrary fixed
+            # pose that most rounds would have no reason to change at all.
+            (round_dir / "incorporated_captures.json").write_text(json.dumps({
+                "round": round_i,
+                "capture_basenames": new_capture_bases,
+                "pre_round_checkpoint_config": str(ckpt_config),
+            }, indent=2))
+
         loop_captures_dir = base_dir / "captures_loop"
         for base_name in new_capture_bases:
             pull_capture(args.robot_run_name, base_name, loop_captures_dir, args.dry_run)
@@ -437,15 +583,50 @@ def main():
                     map_pose_path=str(loop_captures_dir / f"{base_name}_map_pose.json"),
                 )
 
+        is_full_retrain = (args.full_retrain_every > 0 and round_i > 0
+                           and round_i % args.full_retrain_every == 0)
+
+        if args.dry_run:
+            round_budget = "DRY_RUN_PLACEHOLDER"
+            train_iterations = "DRY_RUN_PLACEHOLDER"
+        elif is_full_retrain:
+            train_iterations = args.full_retrain_iterations or args.baseline_iterations
+            # Fresh start, step 0 -- same principle as bootstrap's own budget,
+            # NOT get_checkpoint_step() against the old checkpoint (that
+            # checkpoint's step count is irrelevant to a run starting over).
+            round_budget = train_iterations + args.budget_margin
+            print(f"Round {round_i}: FULL RETRAIN from scratch on the full "
+                  f"accumulated dataset (this is the round that actually picks "
+                  f"up accumulated depth-seeded points), {train_iterations} "
+                  f"iterations, densification ceiling={round_budget}")
+        else:
+            train_iterations = args.resume_iterations
+            current_step = get_checkpoint_step(ckpt_config.parent / "nerfstudio_models")
+            round_budget = current_step + args.resume_iterations + args.budget_margin
+            print(f"Round {round_i}: incremental resume, current_step={current_step}, "
+                  f"densification ceiling this round={round_budget}")
+
+        train_cmd = [sys.executable, str(Path(__file__).parent / "ns_train_patched.py"), "splatfacto",
+                     "--data", str(dataset_dir), "--experiment-name", experiment_name,
+                     "--output-dir", str(base_dir),
+                     "--max-num-iterations", str(train_iterations),
+                     "--pipeline.model.stop-split-at", str(round_budget),
+                     "--optimizers.means.scheduler.max-steps", str(round_budget),
+                     "--vis", "viewer", "--viewer.quit-on-train-completion", "True"]
+        if not is_full_retrain:
+            train_cmd += ["--load-dir", str(ckpt_config.parent / "nerfstudio_models")]
+            if args.pose_source == "direct" and not args.dry_run:
+                # Only meaningful for resume -- a full retrain already reads
+                # the point cloud fresh via populate_modules(), no injection
+                # needed. --injected-points-baseline is intercepted by
+                # ns_train_patched.py itself, not a real nerfstudio flag.
+                baseline = state.data.get("points_at_current_checkpoint")
+                if baseline is not None:
+                    train_cmd += ["--injected-points-baseline", str(baseline)]
+        train_cmd += frozen_dataparser_flags()
+
         rc = run_cmd(
-            [sys.executable, str(Path(__file__).parent / "ns_train_patched.py"), "splatfacto",
-             "--data", str(dataset_dir), "--experiment-name", experiment_name,
-             "--output-dir", str(base_dir),
-             "--load-dir", str(ckpt_config.parent / "nerfstudio_models"),
-             "--max-num-iterations", str(args.resume_iterations),
-             "--pipeline.model.stop-split-at", str(args.total_budget),
-             "--optimizers.means.scheduler.max-steps", str(args.total_budget),
-             "--vis", "viewer", "--viewer.quit-on-train-completion", "True"] + frozen_dataparser_flags(),
+            train_cmd,
             round_dir / "resume_train.log", args.dry_run,
         )
         if rc != 0:
@@ -454,6 +635,12 @@ def main():
         if not args.dry_run:
             state.data["seen_capture_files"].extend(new_capture_bases)
             state.data["last_completed_round"] = round_i
+            if args.pose_source == "direct":
+                # Whatever training path was used, the resulting checkpoint
+                # now reflects points up through the CURRENT total -- either
+                # because a full retrain read them all fresh, or because
+                # resume just injected everything past the old baseline.
+                state.data["points_at_current_checkpoint"] = count_ply_points(dataset_dir / "sparse_pc.ply")
             state.save()
 
         round_i += 1

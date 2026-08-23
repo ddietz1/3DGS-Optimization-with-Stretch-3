@@ -10,3 +10,4 @@
 !/gpu_candidate_puller.py
 !/gpu_main_loop.py
 !/viewpoint_scoring.py
+!/gpu_scripts/
