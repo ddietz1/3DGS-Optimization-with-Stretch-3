@@ -48,12 +48,12 @@ def generate_launch_description():
         parameters=[yamlPath]
     )
 
-    # candidate_generation_node = Node(
-    #     package='candidate_generation',
-    #     executable='generate_candidates',
-    #     name='generate_candidates',
-    #     output='screen'
-    # )
+    candidate_generation_node = Node(
+        package='candidate_generation',
+        executable='generate_candidates',
+        name='generate_candidates',
+        output='screen'
+    )
 
     capture_next_view_process = ExecuteProcess(
         cmd=['python3', '/home/hello-robot/ament_ws/robot_capture_next_view.py',
@@ -71,6 +71,6 @@ def generate_launch_description():
         nav2_launch,
         camera_launch,
         move_joints_node,
-        # candidate_generation_node,
+        candidate_generation_node,
         capture_next_view_process
     ])
