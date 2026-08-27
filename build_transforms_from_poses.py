@@ -77,20 +77,9 @@ def unproject_depth_to_points(depth_m: np.ndarray, rgb: np.ndarray, c2w: np.ndar
 
 def append_points_to_ply(ply_path: Path, new_points: np.ndarray, new_colors: np.ndarray) -> int:
     """Appends points to the dataset's point cloud, preserving the ASCII
-    PLY format the bootstrap itself writes below (confirmed plyfile reads
-    and re-writes this exact hand-written format correctly). Creates the
-    file fresh if it doesn't exist yet (e.g. this dataset was originally
-    built without --build-pointcloud).
-
-    Writes ATOMICALLY: to a temp file first, renamed over the real path
-    only once the write fully succeeds. Confirmed necessary, not just
-    theoretical -- an interrupted write (crash/OOM-kill/Ctrl+C mid-write)
-    left a real corrupted sparse_pc.ply in this exact project: the header
-    claimed more vertices than were actually flushed to disk before the
-    process died, since the header (with the final intended count) is
-    written before the vertex data streams out. A partial write under the
-    old direct-write approach destroys the file; under this approach it
-    just fails to update it, leaving the previous good version intact."""
+    PLY format the bootstrap itself writes below.
+    
+    """
     from plyfile import PlyData, PlyElement
     import os
 
@@ -115,21 +104,6 @@ def append_points_to_ply(ply_path: Path, new_points: np.ndarray, new_colors: np.
 def add_frame_to_dataset(dataset_dir: Path, map_pose_path: Path, session_label: str = None):
     """Adds one new capture to an existing direct-poses dataset, safely.
 
-    Prefixes the copied filename with a session label (auto-derived from
-    the source capture's parent directory name if not given) to avoid the
-    exact filename collision this project already hit once with COLMAP:
-    waypoint/pose numbering resets per session, so identically-named files
-    from different sessions are entirely possible. Refuses to silently
-    overwrite an existing file with the same target name.
-
-    Also seeds the dataset's point cloud with this capture's depth-
-    unprojected points, using the SAME unproject_depth_to_points already
-    used at bootstrap time -- previously, incorporation gave new Gaussians
-    zero explicit geometric anchor, relying entirely on whatever multi-view
-    support happened to already exist nearby for that region. Silently
-    skips seeding (still incorporates the frame normally) if no depth file
-    is found for this capture, since not every capture is guaranteed to
-    have one.
     """
     dataset_dir = Path(dataset_dir)
     map_pose_path = Path(map_pose_path)
@@ -195,6 +169,16 @@ def main():
     ap.add_argument("--height", type=int, required=True)
     ap.add_argument("--build-pointcloud", action="store_true")
     ap.add_argument("--pointcloud-stride", type=int, default=8)
+    ap.add_argument("--exclude-basenames-file", type=Path, default=None,
+                     help="Path to a JSON file containing a list of capture "
+                          "basenames (e.g. 'wp3_d435_pose1_d435') to skip "
+                          "entirely -- excluded from BOTH the transforms.json "
+                          "frame list and point-cloud seeding, since a frame "
+                          "excluded only from the former still leaks its "
+                          "geometry into the model via the latter. Used to "
+                          "carve out a genuinely held-out validation set at "
+                          "bootstrap time (see gpu_main_loop.py's "
+                          "--holdout-poses).")
     args = ap.parse_args()
 
     captures_dir = Path(args.captures_dir)
@@ -202,14 +186,24 @@ def main():
     images_out = out_dir / "images"
     images_out.mkdir(parents=True, exist_ok=True)
 
+    excluded_basenames = set()
+    if args.exclude_basenames_file is not None:
+        excluded_basenames = set(json.loads(args.exclude_basenames_file.read_text()))
+        print(f"Excluding {len(excluded_basenames)} basename(s) from "
+              f"{args.exclude_basenames_file}: {sorted(excluded_basenames)}")
+
     map_pose_files = sorted(captures_dir.glob("*_map_pose.json"))
     print(f"Found {len(map_pose_files)} map_pose.json files")
 
     frames = []
     all_points, all_colors = [], []
+    n_excluded = 0
 
     for map_pose_path in map_pose_files:
         base = map_pose_path.name.replace("_map_pose.json", "")
+        if base in excluded_basenames:
+            n_excluded += 1
+            continue
         rgb_path = captures_dir / f"{base}_rgb.png"
         depth_path = captures_dir / f"{base}_depth.npy"
         if not rgb_path.exists() or not depth_path.exists():
@@ -241,17 +235,12 @@ def main():
         "frames": frames,
     }
     if args.build_pointcloud:
-        # REQUIRED: nerfstudio's dataparser only loads a point cloud if
-        # transforms.json explicitly names it via "ply_file_path" -- it does
-        # NOT auto-discover a file just because it's named sparse_pc.ply and
-        # sits in the data directory (confirmed via source:
-        # nerfstudio_dataparser.py checks `if "ply_file_path" in meta`).
-        # Missing this key is exactly what produces the "no point cloud
-        # found, using random initialization" warning.
+
         meta["ply_file_path"] = "sparse_pc.ply"
     with open(out_dir / "transforms.json", "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"Wrote {len(frames)} frames to {out_dir / 'transforms.json'}")
+    excluded_note = f" ({n_excluded} excluded)" if n_excluded else ""
+    print(f"Wrote {len(frames)} frames to {out_dir / 'transforms.json'}{excluded_note}")
 
     if args.build_pointcloud and all_points:
         points = np.concatenate(all_points, axis=0)

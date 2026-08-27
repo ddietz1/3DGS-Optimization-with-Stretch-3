@@ -10,17 +10,6 @@ Starts gpu_candidate_puller.py running continuously in the background, then:
     robot, wait for the robot to send back a new capture, incorporate it,
     resume-train, check convergence, repeat.
 
-TWO THINGS THIS DEPENDS ON THAT AREN'T BUILT YET (see chat message):
-  1. MoveJoints needs to write a DONE marker file when follow_waypoints()
-     finishes -- this script polls for it. One-line addition needed:
-         open(os.path.join(node.capture_dir, 'DONE'), 'w').close()
-     right after `node.follow_waypoints()` in MoveJoints' main().
-  2. The robot-side "pick a candidate, navigate, capture, done" logic
-     (combining score with travel cost) doesn't exist yet -- this script's
-     wait_for_new_capture() will simply poll indefinitely until something
-     on the robot side actually writes a new capture. That's expected,
-     not a bug in this script.
-
 Checkpointed like run_full_pipeline.py -- state.json tracks whether
 bootstrap is done and which round you're on, so a crash mid-loop resumes
 rather than restarting everything.
@@ -31,20 +20,22 @@ Usage:
     --base-dir outputs/live_run1 \
     --fx 304.02 --fy 302.69 --cx 212.16 --cy 123.31 --width 424 --height 240
 
-Usage (dry run -- print planned commands without executing, same as
-run_full_pipeline.py):
-  python3 gpu_main_loop.py ... --dry-run
-
 Usage (stop after N loop rounds, for a controlled smoke test rather than
 letting it run to convergence -- same idea as the --stop-after ask from
 earlier, now actually implemented):
   python3 gpu_main_loop.py ... --stop-after-round 1
+
+Usage (hold out 3 bootstrap poses from training entirely, and get an
+automatic PSNR-vs-round generalization check for them, logged to
+holdout_poses_history.json every round -- see select_holdout_poses()):
+  python3 gpu_main_loop.py ... --holdout-poses 3
 """
 
 import argparse
 import atexit
 import json
 import math
+import re
 import subprocess
 import sys
 import time
@@ -64,12 +55,7 @@ class State:
             "bootstrap_done": False,
             "last_completed_round": -1,
             "seen_capture_files": [],
-            "points_at_current_checkpoint": None,  # how many points were in
-            # sparse_pc.ply when the CURRENTLY ACTIVE checkpoint was trained --
-            # needed to know which points in the point cloud are genuinely NEW
-            # since that checkpoint, for Gaussian injection. Gaussian count
-            # alone can't answer this (splitting/duplication inflates it
-            # independently of seed point count).
+            "points_at_current_checkpoint": None,
         }
 
     def save(self):
@@ -94,8 +80,7 @@ def get_checkpoint_step(ckpt_dir: Path) -> int:
     filename (e.g. step-000032999.ckpt -> 32999) -- needed to compute a
     densification ceiling that's always ahead of where training actually
     is, rather than a fixed number that silently caps out once enough
-    rounds accumulate past it. Verified against this project's real
-    checkpoint filenames before trusting the parsing."""
+    rounds accumulate past it."""
     ckpts = sorted(ckpt_dir.glob("step-*.ckpt"))
     if not ckpts:
         raise RuntimeError(f"No checkpoints found in {ckpt_dir}")
@@ -104,7 +89,7 @@ def get_checkpoint_step(ckpt_dir: Path) -> int:
 
 
 def count_ply_points(ply_path: Path) -> int:
-    """Total point count currently in the dataset's point cloud -- used as
+    """Total point count currently in the dataset's point cloud, used as
     a baseline to determine which points are genuinely NEW since a given
     checkpoint was trained."""
     if not ply_path.exists():
@@ -139,13 +124,7 @@ def start_candidate_puller(base_dir: Path, dry_run: bool):
     log_path = base_dir / "logs" / "candidate_puller.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_f = open(log_path, "a")
-    # .resolve() is required here, not optional -- Path(__file__).parent can
-    # stay a RELATIVE path (e.g. '.') when this script is invoked as
-    # `python3 gpu_main_loop.py`, and combining that with cwd=str(base_dir)
-    # below breaks the lookup: the relative script path gets resolved
-    # against the NEW cwd (base_dir), which doesn't contain
-    # gpu_candidate_puller.py at all. Confirmed this was the actual cause
-    # of the repeated "can't open file" errors in the log.
+
     puller_script = (Path(__file__).parent / "gpu_candidate_puller.py").resolve()
     proc = subprocess.Popen(
         [sys.executable, "-u", str(puller_script), "--poll-interval", "10"],
@@ -170,17 +149,7 @@ def check_robot_done_marker(robot_run_name: str) -> bool:
 
 def pull_initial_captures(robot_run_name: str, local_dir: Path, dry_run: bool):
     """Uses the same scp-glob pattern already proven working in
-    gpu_transport_test.py's pull_captures() -- avoids requiring rsync,
-    which conflicts with colmap's lz4-c dependency in this conda env (do
-    not force that install; it risks silently breaking colmap).
-
-    IMPORTANT: uses -r + the remote '*' glob rather than scp'ing the
-    directory itself -- scp doesn't support rsync's trailing-slash
-    "contents of" convention, so `scp -r host:dir/ local/` would nest an
-    extra subdirectory level (host:dir/dir/*.png inside local/), breaking
-    build_transforms_from_poses.py's non-recursive `captures_dir.glob(
-    "*_map_pose.json")`. The '*' glob expands on the remote shell, so
-    files land flat in local_dir as intended.
+    gpu_transport_test.py's pull_captures() -- avoids requiring rsync.
     """
     local_dir.mkdir(parents=True, exist_ok=True)
     remote_dir = f"~/stretch_user/captures/{robot_run_name}"
@@ -195,8 +164,7 @@ def pull_initial_captures(robot_run_name: str, local_dir: Path, dry_run: bool):
 
 def list_remote_capture_basenames(robot_run_name: str) -> set:
     """Lists complete (rgb+depth+map_pose all present) capture basenames
-    currently on the robot -- used to detect a NEW loop capture, the same
-    diff-against-seen approach gpu_candidate_puller.py uses for candidates."""
+    currently on the robot -- used to detect a NEW loop capture."""
     remote_dir = f"~/stretch_user/captures/{robot_run_name}"
     cmd = ["ssh", ROBOT_HOST, f"ls {remote_dir} 2>/dev/null || true"]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -217,16 +185,7 @@ def wait_for_new_captures(robot_run_name: str, seen: set, poll_interval: float,
     """Blocks until at least one new capture appears, then waits for the
     new-capture set to stop growing for `settle_polls` consecutive polls
     before returning ALL of them.
-
-    Necessary now that a single NBV stop can produce multiple captures
-    (a multi-shot pan/tilt burst), not just one -- the previous version
-    returned the first new file it saw, which would silently strand the
-    rest as unincorporated 'new' captures that then get wrongly picked up
-    on a LATER round instead of the round they actually belong to.
-
-    This is a debounce, not a guarantee -- if a burst is slower than
-    settle_polls * poll_interval, this can still return early. Increase
-    settle_polls (or poll_interval) if you see truncated batches."""
+    """
     if dry_run:
         print("[dry run] Would poll robot for new captures (skipping the actual wait)")
         return ["DRY_RUN_PLACEHOLDER"]
@@ -265,11 +224,7 @@ def pull_capture(robot_run_name: str, base_name: str, local_dir: Path, dry_run: 
 
 def load_captured_positions(base_dir: Path, capture_basenames: list) -> list:
     """Reads the real, achieved camera position (map frame, from
-    motion_control.py's capture_frame() -- NOT the originally-requested
-    candidate pose) for every capture incorporated so far, whether from the
-    bootstrap set (captures_initial) or a loop round (captures_loop). Used
-    by merge_candidate_files() to exclude candidates that have effectively
-    already been observed."""
+    motion_control.py's capture_frame()"""
     positions = []
     for base_name in capture_basenames:
         for subdir in ("captures_initial", "captures_loop"):
@@ -284,26 +239,13 @@ def merge_candidate_files(candidates_dir: Path, out_path: Path,
                            captured_positions: list = None,
                            exclusion_radius: float = 0.15) -> int:
     """Merges every candidates_*.json file pulled so far into one combined
-    list -- CandidateGenerator only writes ~5 candidates per 30s cycle, so
-    scoring only the latest file (the old behavior) throws away everything
-    from earlier cycles while the robot is stationary. All of it stays
-    spatially valid until the robot actually moves, so it's all worth
-    scoring together. Must genuinely re-score the full merged set every
-    round, even entries seen before -- the model itself changes between
-    rounds (resume-trained), so old scores would be stale against the
-    current checkpoint; there's no valid way to cache them.
+    list.
 
     EXCLUDES candidates within exclusion_radius of any already-captured real
     camera position. Without this, a candidate near a region that's already
     been photographed stays in the pool and can keep re-winning if its
-    scored uncertainty hasn't fully resolved yet -- this is a backstop, not
-    a fix for the scoring mechanism itself (see motion_control.py's
-    post-nav position-convergence check, added because Nav2's goal
-    tolerance alone let real captures land ~0.39m from their intended
-    candidate pose). radius default (0.15m) is intentionally a bit larger
-    than that fix's 0.05m nav-convergence threshold, to also cover the
-    residual gap between a candidate's exact position and wherever the
-    D435 actually ends up after standoff navigation + pan/tilt."""
+    scored uncertainty hasn't fully resolved yet.
+    """
     merged = []
     files = sorted(candidates_dir.glob("candidates_*.json"))
     for f in files:
@@ -327,6 +269,109 @@ def merge_candidate_files(candidates_dir: Path, out_path: Path,
     print(f"Merged {len(files)} candidate files -> {len(merged)} candidates "
           f"({n_excluded} excluded as already-captured within {exclusion_radius}m) -> {out_path}")
     return len(merged)
+
+
+def select_holdout_poses(captures_dir: Path, n: int) -> list:
+    """Picks n bootstrap-capture basenames spread across n DISTINCT
+    waypoints, not just any n captures -- each waypoint is a genuinely
+    different robot base position, while the ~21 poses captured at a given
+    waypoint are just pan/tilt variations from the same spot, so picking
+    naively (e.g. the first n files alphabetically) could easily hold out
+    poses that are all near-duplicates of each other rather than a spatially
+    useful validation set.
+
+    Deterministic (evenly-spaced waypoint indices, first pose by filename
+    at each chosen waypoint) rather than random, so a resumed bootstrap
+    (same captures_initial contents) reselects the identical set without
+    needing to persist a random seed."""
+    if n <= 0:
+        return []
+
+    by_waypoint = {}
+    for p in sorted(captures_dir.glob("*_map_pose.json")):
+        base = p.name.replace("_map_pose.json", "")
+        m = re.match(r"^wp(\d+)_", base)
+        if m:
+            by_waypoint.setdefault(int(m.group(1)), []).append(base)
+
+    waypoints = sorted(by_waypoint)
+    if not waypoints:
+        print("[holdout] WARNING: no 'wp<N>_...'-prefixed captures found in "
+              f"{captures_dir} -- can't select a spatially-spread holdout "
+              "set, disabling holdout for this run.")
+        return []
+    if n > len(waypoints):
+        print(f"[holdout] WARNING: requested {n} holdout poses but only "
+              f"{len(waypoints)} distinct waypoints exist -- capping to {len(waypoints)}.")
+        n = len(waypoints)
+
+    if n == 1:
+        indices = [len(waypoints) // 2]
+    else:
+        indices = sorted(set(round(i * (len(waypoints) - 1) / (n - 1)) for i in range(n)))
+
+    return [sorted(by_waypoint[waypoints[idx]])[0] for idx in indices]
+
+
+def render_holdout_psnr(holdout_poses: list, base_dir: Path, dataset_dir: Path,
+                         ckpt_config: Path, tag: str) -> dict:
+    """Renders every held-out pose against ckpt_config and returns
+    {basename: psnr}. Reuses render_pose.py exactly as used for the manual
+    before/after validation this replaces -- --psnr-out-json gives back a
+    structured result instead of scraping it out of stdout. Ground-truth
+    images/poses are read from captures_initial, since holdout poses are
+    always drawn from the bootstrap set."""
+    if not holdout_poses:
+        return {}
+
+    results = {}
+    out_dir = base_dir / "holdout_renders" / tag
+    intrinsics_json = dataset_dir / "transforms.json"
+
+    for base_name in holdout_poses:
+        pose_json = base_dir / "captures_initial" / f"{base_name}_map_pose.json"
+        ref_image = base_dir / "captures_initial" / f"{base_name}_rgb.png"
+        psnr_json = out_dir / f"{base_name}.json"
+        cmd = [sys.executable, str(Path(__file__).parent / "render_pose.py"),
+               "--load-config", str(ckpt_config), "--pose-json", str(pose_json),
+               "--intrinsics-json", str(intrinsics_json),
+               "--output", str(out_dir / f"{base_name}.png"),
+               "--reference-image", str(ref_image),
+               "--psnr-out-json", str(psnr_json)]
+        rc = run_cmd(cmd, base_dir / "logs" / "holdout_render.log", dry_run=False)
+        if rc != 0:
+            print(f"[holdout] WARNING: render failed for {base_name} against "
+                  f"'{tag}' -- skipping (see logs/holdout_render.log)")
+            continue
+        try:
+            results[base_name] = json.loads(psnr_json.read_text())["psnr"]
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            print(f"[holdout] WARNING: couldn't read PSNR result for {base_name}: {e}")
+    return results
+
+
+def log_holdout_history(base_dir: Path, round_label, per_pose_psnr: dict):
+    """Appends one entry to holdout_poses_history.json, keyed by
+    round_label ('bootstrap' or an int round number). If an entry for this
+    round_label already exists -- a crash-resumed round re-running from
+    scratch -- REPLACES it rather than appending a duplicate, the same
+    staleness class of bug found in convergence_history.json."""
+    if not per_pose_psnr:
+        return
+    history_path = base_dir / "holdout_poses_history.json"
+    history = json.loads(history_path.read_text()) if history_path.exists() else []
+    history = [e for e in history if e["round"] != round_label]
+    mean_psnr = sum(per_pose_psnr.values()) / len(per_pose_psnr)
+    history.append({
+        "round": round_label,
+        "timestamp": datetime.now().isoformat(),
+        "per_pose_psnr": per_pose_psnr,
+        "mean_psnr": mean_psnr,
+    })
+    history.sort(key=lambda e: -1 if e["round"] == "bootstrap" else e["round"])
+    history_path.write_text(json.dumps(history, indent=2))
+    print(f"[holdout] round={round_label}: mean PSNR={mean_psnr:.2f} dB "
+          f"across {len(per_pose_psnr)} held-out pose(s) -> {history_path}")
 
 
 def main():
@@ -398,15 +443,26 @@ def main():
                           "rough slack for residual yaw error and standoff/pan-tilt "
                           "geometry -- re-tune from real candidate-vs-achieved-capture-"
                           "position gaps once the position fix has been run for real.")
+    ap.add_argument("--holdout-poses", type=int, default=0,
+                     help="Hold out this many bootstrap captures (spread "
+                          "across distinct waypoints) from training entirely "
+                          "-- never added to the dataset, ever. Every round "
+                          "(plus once right after bootstrap), each held-out "
+                          "pose is rendered against the current checkpoint "
+                          "and scored by PSNR against its real photo, logged "
+                          "to holdout_poses_history.json. This is a standing "
+                          "generalization check: does reconstruction quality "
+                          "improve somewhere OTHER than whatever pose was "
+                          "just captured and trained on this round -- as "
+                          "opposed to convergence_history.json's score, which "
+                          "only reflects the just-visited pose. direct-pose-"
+                          "source only. 0 disables (default).")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     base_dir = Path(args.base_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
     state = State(base_dir)
-    # Deterministic from pose_source alone -- must be correct even when the
-    # bootstrap block below is SKIPPED on a resumed run (bootstrap_done
-    # already True), not just when bootstrap actually executes this time.
     dataset_dir = (base_dir / "dataset" if args.pose_source == "direct"
                    else base_dir / "colmap_raw" / "transforms_map_frame.json")
     experiment_name = "live_model"
@@ -425,13 +481,30 @@ def main():
         initial_captures_dir = base_dir / "captures_initial"
         pull_initial_captures(args.robot_run_name, initial_captures_dir, args.dry_run)
 
+        holdout_poses = []
+        if args.holdout_poses > 0:
+            if args.pose_source != "direct":
+                print("[holdout] WARNING: --holdout-poses only supports "
+                      "--pose-source direct right now -- disabling holdout "
+                      "for this run.")
+            elif args.dry_run:
+                print(f"[dry run] Would select {args.holdout_poses} holdout pose(s)")
+            else:
+                holdout_poses = select_holdout_poses(initial_captures_dir, args.holdout_poses)
+                (base_dir / "holdout_poses.json").write_text(json.dumps(holdout_poses, indent=2))
+                print(f"[holdout] Holding out {len(holdout_poses)} pose(s), "
+                      f"never added to training: {holdout_poses}")
+
         if args.pose_source == "direct":
-            rc = run_cmd(
-                [sys.executable, str(Path(__file__).parent / "build_transforms_from_poses.py"),
+            build_cmd = [sys.executable, str(Path(__file__).parent / "build_transforms_from_poses.py"),
                  "--captures-dir", str(initial_captures_dir), "--out-dir", str(dataset_dir),
                  "--fx", str(args.fx), "--fy", str(args.fy), "--cx", str(args.cx),
                  "--cy", str(args.cy), "--width", str(args.width), "--height", str(args.height),
-                 "--build-pointcloud"],
+                 "--build-pointcloud"]
+            if holdout_poses:
+                build_cmd += ["--exclude-basenames-file", str(base_dir / "holdout_poses.json")]
+            rc = run_cmd(
+                build_cmd,
                 base_dir / "logs" / "build_dataset.log", args.dry_run,
             )
             if rc != 0:
@@ -467,8 +540,7 @@ def main():
                 raise RuntimeError("colmap_map_align.py bulk-apply failed")
 
         # Starting from step 0, so this round's ceiling is simply this
-        # call's own iteration count plus margin -- same dynamic principle
-        # as the resume rounds below, just with no prior checkpoint to read.
+        # call's own iteration count plus margin
         bootstrap_budget = args.baseline_iterations + args.budget_margin
         rc = run_cmd(
             [sys.executable, str(Path(__file__).parent / "ns_train_patched.py"), "splatfacto",
@@ -482,6 +554,12 @@ def main():
         if rc != 0:
             raise RuntimeError("Initial training failed")
 
+        if not args.dry_run and holdout_poses:
+            bootstrap_config = find_latest_config(base_dir, experiment_name)
+            per_pose = render_holdout_psnr(holdout_poses, base_dir, dataset_dir,
+                                            bootstrap_config, tag="bootstrap")
+            log_holdout_history(base_dir, "bootstrap", per_pose)
+
         if not args.dry_run:
             state.data["bootstrap_done"] = True
             state.data["seen_capture_files"] = list(
@@ -494,6 +572,10 @@ def main():
         print("=== Bootstrap complete ===\n")
 
     # --- PHASE 2: continuous loop ---
+    # Reload rather than reuse the bootstrap block's local variable
+    holdout_poses_file = base_dir / "holdout_poses.json"
+    holdout_poses = json.loads(holdout_poses_file.read_text()) if holdout_poses_file.exists() else []
+
     round_i = state.data["last_completed_round"] + 1
     while True:
         if args.stop_after_round is not None and round_i > args.stop_after_round:
@@ -552,10 +634,7 @@ def main():
 
         if not args.dry_run:
             # Records exactly which captures belong to THIS round, plus which
-            # checkpoint was current before this round's training -- needed
-            # to later render "this round's own newly-captured pose, before
-            # vs after THIS round's training" rather than an arbitrary fixed
-            # pose that most rounds would have no reason to change at all.
+            # checkpoint was current before this round's training
             (round_dir / "incorporated_captures.json").write_text(json.dumps({
                 "round": round_i,
                 "capture_basenames": new_capture_bases,
@@ -616,10 +695,6 @@ def main():
         if not is_full_retrain:
             train_cmd += ["--load-dir", str(ckpt_config.parent / "nerfstudio_models")]
             if args.pose_source == "direct" and not args.dry_run:
-                # Only meaningful for resume -- a full retrain already reads
-                # the point cloud fresh via populate_modules(), no injection
-                # needed. --injected-points-baseline is intercepted by
-                # ns_train_patched.py itself, not a real nerfstudio flag.
                 baseline = state.data.get("points_at_current_checkpoint")
                 if baseline is not None:
                     train_cmd += ["--injected-points-baseline", str(baseline)]
@@ -631,6 +706,12 @@ def main():
         )
         if rc != 0:
             raise RuntimeError(f"Resume training failed in round {round_i}")
+
+        if not args.dry_run and holdout_poses:
+            round_config = find_latest_config(base_dir, experiment_name)
+            per_pose = render_holdout_psnr(holdout_poses, base_dir, dataset_dir,
+                                            round_config, tag=f"round_{round_i:04d}")
+            log_holdout_history(base_dir, round_i, per_pose)
 
         if not args.dry_run:
             state.data["seen_capture_files"].extend(new_capture_bases)

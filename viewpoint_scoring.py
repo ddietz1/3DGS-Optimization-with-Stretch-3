@@ -2,42 +2,6 @@
 Standalone viewpoint-scoring harness -- v3: real GauSS-MI Shannon mutual
 information, reimplemented in plain PyTorch (no CUDA build required).
 
-Ported from reading GauSS-MI's actual CUDA source
-(diff-gaussian-rasterization-gaussmi/cuda_rasterizer/forward.cu) and
-map_backend.py::update_reliability. This is a faithful reimplementation of
-their MATH, not their CUDA kernel -- one piece (mapping a training view's
-pixel loss back onto individual Gaussians) is an explicit APPROXIMATION,
-flagged where it happens, since their kernel does this via a custom
-per-(pixel,Gaussian) atomic scatter during rasterization that gsplat's public
-API doesn't expose. Everything else (reliability storage/update recursion,
-the view-dependent interpolation coefficient, the alpha-compositing MI
-accumulation) matches their formulas.
-
-Pipeline:
-  1. Load pipeline + Gaussians + training cameras (unchanged from v2).
-  2. Initialize a per-Gaussian reliability tensor (N,4), one value per
-     cardinal direction bin (+x,+y,-x,-y), starting at 0.5 -- matches
-     GaussianModel._reliability's init.
-  3. RELIABILITY UPDATE PASS over all training views: for each view, render,
-     compute photometric loss vs the real image, transform via the paper's
-     -log(lambda*L) recipe, approximate the per-Gaussian loss attribution
-     (APPROXIMATION -- see update_reliability_from_view), fold into the
-     persistent reliability via a log-odds Bayesian update (exact match to
-     their recursion).
-  4. SANITY CHECK (unchanged from v2): nerfstudio's own render vs. our
-     gsplat render vs. the real image, to validate pose/convention math.
-  5. Candidate generation (unchanged from v2).
-  6. SCORING: for each candidate, compute the view-dependent interpolation
-     coefficient from Gaussian position -> candidate camera position (exact
-     port of computeUnreliableCoeff), combine with the current reliability
-     to get a per-Gaussian "unreliable1" scalar (exact match), render it
-     through gsplat as if it were a color channel so alpha-compositing sums
-     it correctly (exact match to their `MI += unreliable1*alpha*T`), sum
-     over pixels for the candidate's total expected information gain.
-
-Known things to verify in YOUR environment:
-  - gsplat API surface (targets gsplat>=1.0 `rasterization()`).
-  - nerfstudio version differences (Cameras/get_outputs_for_camera/dataset).
 """
 
 import json
@@ -63,9 +27,6 @@ except ImportError as e:
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Reliability-update hyperparameters (names match the paper/code's own
-# lambda_L, lambda_T, min_loss -- tune these; the paper's exact values
-# aren't in the released config in a way I could confirm from here).
 LAMBDA_L = 1.0
 LAMBDA_T = 1.0
 MIN_LOSS = 1e-3
@@ -115,8 +76,7 @@ def get_training_cameras(pipeline):
 
 
 # ----------------------------------------------------------------------
-# 2. Reliability model -- exact port of GaussianModel._reliability +
-#    computeUnreliableCoeff + the log-odds update recursion.
+# 2. Reliability model
 # ----------------------------------------------------------------------
 
 def init_reliability(n_gaussians: int) -> torch.Tensor:
@@ -171,7 +131,7 @@ def compute_unreliable1(reliability: torch.Tensor, means: torch.Tensor, cam_pos:
 
 
 # ----------------------------------------------------------------------
-# 3. Convention conversion (unchanged from v2)
+# 3. Convention conversion
 # ----------------------------------------------------------------------
 
 def c2w_to_viewmat(c2w_3x4: torch.Tensor) -> torch.Tensor:
@@ -273,7 +233,6 @@ def update_reliability_from_view(gaussians, reliability, cam_single, real_image,
     # only Gaussians that are dominant contributors somewhere in this view.
     dominant = visible & (gaussians["opacities"] > DOMINANT_T_THRESHOLD * 0 + 0.1)
     # (opacity > small threshold is our stand-in for "T > 0.8 dominant contributor";
-    # we don't have per-pixel T here, so we can't reproduce their exact gate.)
 
     attributed = torch.zeros_like(coeff)
     attributed[dominant] = loss_prime * LAMBDA_T * coeff[dominant]
@@ -351,7 +310,7 @@ def prune_floaters(gaussians, cam_positions: np.ndarray, scale_percentile=99.9,
 
 
 # ----------------------------------------------------------------------
-# 5. Sanity check (unchanged from v2)
+# 5. Sanity check
 # ----------------------------------------------------------------------
 
 def sanity_check(pipeline, gaussians, cameras, check_index: int, out_path: str, use_eval: bool = False):
@@ -406,7 +365,7 @@ def sanity_check(pipeline, gaussians, cameras, check_index: int, out_path: str, 
 
 
 # ----------------------------------------------------------------------
-# 6. Candidate generation (unchanged from v2)
+# 6. Candidate generation
 # ----------------------------------------------------------------------
 
 def fibonacci_sphere(n, radius, center, min_elev_deg=-10.0):
@@ -444,7 +403,7 @@ def generate_candidates(scene_center, radius, n_candidates):
 
 
 # ----------------------------------------------------------------------
-# 7. Scoring -- real Shannon MI via alpha-compositing (exact match)
+# 7. Scoring
 # ----------------------------------------------------------------------
 
 def score_candidate_mi(gaussians, reliability, c2w_np, template_intrinsics):
@@ -458,8 +417,7 @@ def score_candidate_mi(gaussians, reliability, c2w_np, template_intrinsics):
                       dtype=torch.float32, device=DEVICE).unsqueeze(0)
 
     unreliable1 = compute_unreliable1(reliability, gaussians["means"], cam_pos)  # (N,)
-    # Render as a 3-channel "color" (broadcast) so we don't depend on this
-    # gsplat version supporting single-channel colors -- take channel 0 back out.
+    # Render as a 3-channel "color"
     mi_colors = unreliable1.unsqueeze(-1).repeat(1, 3)
     render, _, _ = render_our_own(gaussians, viewmat, K, w, h, colors_override=mi_colors)
     mi_map = render[0, :, :, 0]  # (H,W) -- MI channel, alpha-composited exactly like color
@@ -574,11 +532,7 @@ def main():
               f"(skipping candidate generation)")
     else:
         # Derive the candidate region from TRAINING CAMERA positions, not the
-        # Gaussian point cloud's bounding extent -- splatfacto scenes commonly
-        # contain stray/flyaway background Gaussians (random init, thin floor
-        # splats) that inflate the point-cloud extent far past the real scene.
-        # Candidates sampled against that inflated extent land inside the stray
-        # region and produce degenerate scattered renders.
+        # Gaussian point cloud's bounding extent
         cam_positions = cameras.camera_to_worlds[:, :3, 3].cpu().numpy()
         scene_center = cam_positions.mean(axis=0)
         if args.radius is None:
@@ -616,9 +570,7 @@ def main():
 
 
 # ----------------------------------------------------------------------
-# 8. Depth confidence -- same log-odds mechanism as photometric reliability,
-#    but the "measurement" is a depth residual against real sensor depth
-#    instead of a photometric residual against a real photo.
+# 8. Depth confidence
 # ----------------------------------------------------------------------
 
 def build_frame_to_depth_map(source_rgb_dir, raw_captures_dir):
@@ -677,11 +629,7 @@ def build_frame_to_depth_map(source_rgb_dir, raw_captures_dir):
 
 
 def load_raw_depth(depth_path, target_hw=None, assume_mm_uint16="auto"):
-    """Loads a raw depth .npy file. RealSense D435 depth is commonly stored
-    as uint16 millimeters OR float32 meters depending on capture script --
-    'auto' guesses from dtype, but VERIFY this matches your actual capture
-    format during your spot check (wrong units silently produces a
-    confidently-wrong depth-confidence signal, not an error)."""
+    """Loads a raw depth .npy file."""
     arr = np.load(depth_path)
     if assume_mm_uint16 == "auto":
         is_mm = arr.dtype == np.uint16
@@ -705,19 +653,7 @@ def init_depth_confidence(n_gaussians: int) -> torch.Tensor:
 def estimate_depth_scale_factor(gaussians, cameras, frame_to_depth_map, frame_indices, max_views=5):
     """Estimates the scale factor between the reconstruction's own coordinate
     units (arbitrary/uncalibrated, since auto_scale_poses=False) and real
-    metric sensor depth. Without this, comparing rendered "depth" directly
-    against real sensor depth compares across an unknown scale factor,
-    producing large, systematically-biased residuals regardless of true
-    accuracy -- confirmed as the likely cause of depth confidence sitting
-    persistently around 0.3 (below the 0.5 init) rather than climbing
-    toward 1.0 the way photometric reliability does, and of depth-guided
-    selection hurting rather than helping PSNR (it was chasing scale-
-    mismatch noise, not real geometric gaps).
-
-    Classic "median ratio" scale-alignment trick from monocular depth
-    literature: for a few sample views, render depth, compare to real
-    depth at valid pixels, take each view's median ratio (real/rendered),
-    then take the median across views for robustness.
+    metric sensor depth.
     """
     ratios = []
     n_check = min(max_views, cameras.size)
@@ -762,14 +698,6 @@ def update_depth_confidence_from_view(gaussians, cam_single, real_depth_m, w, h,
                                        lambda_d=1.0, min_depth_loss=1e-3, dominant_opacity=0.1):
     """Depth analogue of update_reliability_from_view.
 
-    FIXED: originally collapsed the whole frame's depth error into one
-    scalar and broadcast it to every dominant Gaussian -- this threw away
-    all spatial detail (a Gaussian near a perfectly-measured floor patch
-    got the same update as one near a sensor blind spot), leaving only the
-    smooth analytic directional coefficient visible in the final heatmap.
-    Now projects each Gaussian into this camera's pixel space directly and
-    samples the REAL per-pixel residual at its own location, so confidence
-    actually varies with where each Gaussian sits, not just viewing angle.
     """
     c2w = cam_single.camera_to_worlds[0].to(DEVICE)
     viewmat = c2w_to_viewmat(c2w).unsqueeze(0)
@@ -883,18 +811,6 @@ def render_depth_confidence_scalar(gaussians, depth_confidence, viewmat, K, w, h
 def render_depth_confidence_heatmap(gaussians, depth_confidence, viewmat, K, w, h, colormap="jet"):
     """Renders per-Gaussian depth confidence as a heatmap.
 
-    IMPORTANT: uses a VIEW-INDEPENDENT scalar (mean confidence across all 4
-    directional bins), NOT compute_unreliable1's view-dependent
-    interpolation. That interpolation is correct and necessary for scoring
-    a candidate pose (Section: view-dependent MI), but for a comparison
-    heatmap it bakes in a large, dominant geometric artifact purely from
-    the display camera's angle relative to each Gaussian (a smooth
-    chevron/diamond pattern) that swamps the real per-Gaussian signal
-    underneath it -- confirmed empirically: percentile-based contrast
-    stretching didn't change the visual pattern at all, because the
-    geometric component and the real signal are already additively mixed
-    at each pixel before any colormap sees them; no output-side
-    renormalization can separate them after the fact.
     """
     import matplotlib.cm as cm
 
@@ -926,9 +842,6 @@ def get_original_indices_for_training_set(pipeline, basename_to_index: dict) -> 
     original full-dataset index, by matching filenames. Needed because
     pipeline.datamanager.train_dataset.cameras is indexed 0..n_revealed-1
     for whatever subset THIS round trained on, not by original index."""
-    # NOTE: _dataparser_outputs is an internal attribute -- confirmed present
-    # in this nerfstudio version via base_dataset.py's get_numpy_image, but
-    # re-verify if this errors on a different version.
     image_filenames = pipeline.datamanager.train_dataset._dataparser_outputs.image_filenames
     indices = []
     for path in image_filenames:
