@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import random
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -104,13 +105,30 @@ def main():
                           "gpu_candidate_puller.latest_local_candidates_file()")
     ap.add_argument("--top-n", type=int, default=10)
     ap.add_argument("--out-dir", default="scoring_live")
+    ap.add_argument("--random-baseline", action="store_true",
+                     help="Ablation mode: instead of sending the --top-n highest-scoring "
+                          "candidates to the robot, send a random sample of --top-n "
+                          "candidates instead. Scoring itself (candidate_scores.json) is "
+                          "unaffected -- every candidate is still scored normally -- only "
+                          "which ones get SENT to the robot changes, so the score/PSNR "
+                          "trend this run produces is directly comparable to a "
+                          "normal (scored-selection) run.")
+    ap.add_argument("--random-seed", type=int, default=None,
+                     help="Optional seed for --random-baseline's sampling, for "
+                          "reproducibility. Unseeded (default) draws fresh each round.")
     args = ap.parse_args()
 
     scores_path = run_scoring(args.load_config, args.candidates_file, args.out_dir)
     scored = json.loads(scores_path.read_text())  # already sorted best-first
 
-    top_n = scored[:args.top_n]
-    print(f"\nTop {len(top_n)} candidates (of {len(scored)} scored):")
+    if args.random_baseline:
+        rng = random.Random(args.random_seed) if args.random_seed is not None else random
+        top_n = rng.sample(scored, min(args.top_n, len(scored)))
+        print(f"\n[random-baseline] Randomly selected {len(top_n)} candidates "
+              f"(of {len(scored)} scored) -- NOT the top-scoring ones:")
+    else:
+        top_n = scored[:args.top_n]
+        print(f"\nTop {len(top_n)} candidates (of {len(scored)} scored):")
     for i, entry in enumerate(top_n):
         print(f"  #{i}: score={entry['score']:.4f}  pos={entry['position']}")
 
@@ -129,7 +147,8 @@ def main():
     }
 
     sent_name = send_to_robot(payload)
-    print(f"\nSent top {len(top_n)} candidates to robot as {ROBOT_SCORED_DIR}/{sent_name}")
+    label = "randomly-selected" if args.random_baseline else "top"
+    print(f"\nSent {len(top_n)} {label} candidates to robot as {ROBOT_SCORED_DIR}/{sent_name}")
 
 
 if __name__ == "__main__":

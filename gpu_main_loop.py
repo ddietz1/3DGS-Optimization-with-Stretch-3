@@ -457,6 +457,24 @@ def main():
                           "opposed to convergence_history.json's score, which "
                           "only reflects the just-visited pose. direct-pose-"
                           "source only. 0 disables (default).")
+    ap.add_argument("--random-baseline", action="store_true",
+                     help="Ablation mode: passed straight through to "
+                          "score_and_return_top_candidates.py -- send a random "
+                          "--top-n candidates to the robot each round instead "
+                          "of the --top-n highest-scoring ones. Scoring itself "
+                          "is unaffected, only which candidates get SENT.")
+    ap.add_argument("--random-seed", type=int, default=None,
+                     help="Optional seed for --random-baseline's sampling, "
+                          "passed straight through. Unseeded (default) draws "
+                          "fresh each round.")
+    ap.add_argument("--skip-convergence-check", action="store_true",
+                     help="check_convergence.py still runs and still logs to "
+                          "convergence_history.json every round, but a CONVERGED "
+                          "result no longer stops the loop. For runs (e.g. "
+                          "--random-baseline ablations) where you want a fixed "
+                          "round count to match another run, rather than "
+                          "whatever round the top-candidate-score plateau check "
+                          "happens to fire on.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -607,10 +625,15 @@ def main():
                                    captured_positions=captured_positions,
                                    exclusion_radius=args.capture_exclusion_radius)
 
-        rc = run_cmd(
-            [sys.executable, str(Path(__file__).parent / "score_and_return_top_candidates.py"),
+        score_cmd = [sys.executable, str(Path(__file__).parent / "score_and_return_top_candidates.py"),
              "--load-config", str(ckpt_config), "--candidates-file", str(candidates_file),
-             "--top-n", str(args.top_n), "--out-dir", str(round_dir / "scoring")],
+             "--top-n", str(args.top_n), "--out-dir", str(round_dir / "scoring")]
+        if args.random_baseline:
+            score_cmd += ["--random-baseline"]
+            if args.random_seed is not None:
+                score_cmd += ["--random-seed", str(args.random_seed)]
+        rc = run_cmd(
+            score_cmd,
             round_dir / "score_and_return.log", args.dry_run,
         )
         if rc != 0:
@@ -624,8 +647,13 @@ def main():
             round_dir / "convergence.log", args.dry_run,
         )
         if rc == 1:
-            print(f"\n=== CONVERGED at round {round_i} -- stopping loop ===")
-            break
+            if args.skip_convergence_check:
+                print(f"\n=== Round {round_i}: check_convergence.py says CONVERGED, but "
+                      f"--skip-convergence-check is set -- continuing anyway (still logged "
+                      f"to convergence_history.json) ===")
+            else:
+                print(f"\n=== CONVERGED at round {round_i} -- stopping loop ===")
+                break
         elif rc not in (0, 1) and not args.dry_run:
             raise RuntimeError(f"check_convergence.py errored unexpectedly (exit {rc})")
 
