@@ -1,17 +1,15 @@
 # 3DGS-Optimization-with-Stretch-3
 
-* Derek Dietz
-
 ## Summary
-A system for optimizing the creation of a 3D Gaussian Splatting model of a scene using a Hello Robot Stretch 3.
+A system for optimizing the creation of a 3D Gaussian Splatting model of a scene using a Hello Robot Stretch 3. 
 
 ## Overview
 The system integrates:
 
 * ROS2 nodes for controlling the onboard camera of the robot, navigating to waypoints, sampling and validating next-best-view candidate poses against the local costmap/Nav2 planner, and capturing RGB-D images with the mounted D435 RealSense camera.
-* Python scripts on a separate GPU for building and updating a 3D Gaussian Splatting model with NerfStudio/gsplat, automatically seeding Gaussian primitives from the camera's depth data, and scoring reachable candidate poses by Shannon Mutual Information (an active-view-selection / next-best-view strategy).
+* Python scripts on a separate GPU for building and updating a 3D Gaussian Splatting model with NerfStudio, automatically seeding Gaussian primitives from the camera's depth data, and scoring reachable candidate poses by Shannon Mutual Information (an active-view-selection / next-best-view strategy).
 
-Together, these let the pipeline automatically capture a scene, train an initial 3DGS model, and iteratively drive the robot to the most informative next viewpoint — closing the loop between "where does the model need more data" and "go get that data" without manual waypoint picking after the first pass.
+Together, these let the pipeline automatically capture a scene, train an initial 3DGS model, and iteratively drive the robot to the most informative next viewpoint.
 
 ## Package List
 This repository consists of three ROS2 packages plus a set of standalone Python scripts run on a GPU workstation.
