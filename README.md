@@ -124,8 +124,9 @@ This project's Shannon-MI viewpoint scoring is a plain-PyTorch reimplementation 
 [video link]
 
 ## Video showing a high scoring pose being slowly rendered better after a single round
-[video link]
+https://github.com/user-attachments/assets/c097206c-a71c-4437-8668-94fcb764495a
 
 ## Data
 ### Graph showing PSNR (Peak Signal to Noise Ratio) for an optimized run versus a run that uses the same number of random images in one shot
-*[Insert graph image here.]*
+<img width="1050" height="750" alt="held_out_view_quality" src="https://github.com/user-attachments/assets/43f5f3b0-30d4-4a24-b66c-631ccc834009" />
+
