@@ -62,9 +62,7 @@ def _rz(angle):
 
 
 # Every joint in the base_link -> camera_color_optical_frame chain,
-# transcribed directly from the robot's real URDF. These are FIXED
-# constants (module level), computed once -- same pattern as _R1/_R2/_R3
-# for the D405.
+# transcribed directly from the robot's real URDF
 _T_MAST = _urdf_transform(
     [-0.06787803263552088, 0.13388003220833036, 0.0260182606860205],
     [1.5797577454512997, -0.004523913291614168, -0.002246389706701435])
@@ -373,7 +371,7 @@ class MoveJoints(HelloNode):
         self.marker.type = Marker.ARROW
         self.marker.action = Marker.ADD
 
-        # Marker arrows point along local +x by convention; our target
+        # Marker arrows point along local +x by convention, target
         # orientation's "forward" is along local +z. Rotate +90 deg about Y
         # so the arrow visually points along the same direction the camera
         # will actually face.
@@ -412,14 +410,8 @@ class MoveJoints(HelloNode):
         test_pose.pose.position = request.pose.position
         test_pose.pose.orientation = request.pose.orientation
 
-        # Decompose with the SAME 'xyz' Euler convention CandidateGenerator
-        # almost certainly used to build this quaternion (roll is always
-        # exactly 0.0 in the candidate JSON -- a strong sign it was
-        # constructed, not decomposed, this way). This should round-trip to
-        # the exact original yaw, unlike the earlier ad-hoc axis-rotation
-        # derivation that likely caused the sign flip.
+        # Decompose with the SAME 'xyz' Euler convention
         q = test_pose.pose.orientation
-        # target_yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
 
         look_dir_world = R.from_quat([q.x, q.y, q.z, q.w]).apply([0, 0, 1])  # Z-forward, matching real camera poses
         target_yaw = atan2(look_dir_world[1], look_dir_world[0])
@@ -447,17 +439,7 @@ class MoveJoints(HelloNode):
             return response
 
         time.sleep(0.5)
-        # No rotate_base(pi) needed -- base_yaw was solved to already face
-        # the right direction, not left to chance and patched after the fact.
-
-        # Nav2's SimpleGoalChecker (xy_goal_tolerance=0.25m, see
-        # stretch_nav2/config/nav2_params.yaml) reports SUCCEEDED well outside
-        # the precision candidate-pose scoring needs -- confirmed via a real
-        # capture landing ~0.39m from its intended candidate pose, entirely
-        # within that tolerance. Read back the ACTUAL achieved base position
-        # and re-drive if the residual is still too large, so the camera
-        # ends up close enough to the candidate pose that Shannon-MI scoring
-        # treats this as having genuinely observed from there.
+ 
         max_base_position_error = 0.05  # meters
         max_reposition_attempts = 2
         for attempt in range(max_reposition_attempts):
@@ -636,9 +618,7 @@ class MoveJoints(HelloNode):
     def _camera_orientation_in_base(self, yaw, pitch):
         """Forward model: given wrist_yaw and wrist_pitch, compute the camera
         optical frame's orientation in base_link, using the real measured
-        transforms (no re-derivation of axis conventions needed).
-
-        Both joints rotate about their local -Z axis per the URDF.
+        transforms.
         """
         Rz_yaw = R.from_euler('z', -yaw)
         Rz_pitch = R.from_euler('z', -pitch)
@@ -647,18 +627,13 @@ class MoveJoints(HelloNode):
     def solve_wrist_for_direction(self, desired_forward_in_base, yaw_limits, pitch_limits):
         """Find (yaw, pitch) so the camera's forward axis matches
         desired_forward_in_base (a unit vector, in base_link frame).
-
-        This runs entirely on the analytical model above — no physical robot
-        movement required, so it's fast (milliseconds) even though it's a
-        numerical search.
         """
         desired_forward_in_base = np.array(desired_forward_in_base) / np.linalg.norm(desired_forward_in_base)
 
         def cost(params):
             yaw, pitch = params
             cam_rot = self._camera_orientation_in_base(yaw, pitch)
-            # Camera's own forward axis is +Z in its optical frame (per your
-            # earlier RViz finding: Z-forward, X-left, Y-up)
+
             current_forward = cam_rot.apply([0.0, 0.0, 1.0])
             return 1.0 - np.dot(current_forward, desired_forward_in_base)  # 0 = perfect alignment
 
@@ -675,15 +650,7 @@ class MoveJoints(HelloNode):
     def compute_base_pose_for_camera_target(self, target_pose: PoseStamped, target_yaw: float):
         """Solves base (x, y, yaw) so that, after driving there, the D435
         camera's position matches target_pose's (x, y) as closely as
-        physically possible -- NOT compute_standoff_dist, which solves a
-        different problem (stand off from a point) that doesn't apply here,
-        since the D435's mast is rigid: pan/tilt only rotate the camera, they
-        never translate it. Camera HEIGHT cannot be controlled at all (fixed
-        by mast geometry) -- target z is best-effort only, logged but not
-        solvable.
-
-        Assumes head pan/tilt are currently at (0, 0) -- call this right after
-        zeroing them, exactly like test_d435_ik already does at the top.
+        physically possible.
         """
         try:
             tf = self.tf_buffer.lookup_transform(
@@ -764,9 +731,6 @@ class MoveJoints(HelloNode):
 
         x0 = np.array([0.0, 0.0, 0.0])
 
-        # Build an explicit initial simplex so base_yaw_delta is actually explored --
-        # Nelder-Mead's default simplex step for a zero-valued x0 component is
-        # tiny (~0.00025), which effectively never perturbs base_yaw_delta.
         best_result = None
         starting_points = [
             [0.0, 0.0, 0.0],
@@ -794,9 +758,8 @@ class MoveJoints(HelloNode):
     
     def _base_to_camera_rotation(self, pan: float, tilt: float) -> np.ndarray:
         """Full forward kinematics, base_link -> camera_color_optical_frame,
-        as a function of the two joint angles. Verified against a real
-        tf2_echo measurement at pan=tilt=0 (0.82 deg agreement) before being
-        trusted for the solver below."""
+        as a function of the two joint angles.
+        """
         Tm = (_T_MAST @ _T_HEAD @ _T_PAN_ORIGIN @ _rz(pan) @ _T_TILT_ORIGIN @ _rz(tilt)
             @ _T_CAMERA_JOINT @ _T_CAMERA_LINK_JOINT @ _T_CAMERA_COLOR_JOINT @ _T_CAMERA_COLOR_OPTICAL_JOINT)
         return Tm[:3, :3]
@@ -804,10 +767,9 @@ class MoveJoints(HelloNode):
     
     def compute_d435_pan_tilt_for_orientation(self, target_pose):
         """Solve head pan/tilt so the D435 optical axis matches the
-        orientation of target_pose, using a real forward-kinematic model +
-        numerical solve -- mirrors solve_wrist_for_direction's proven approach
-        for the D405, rather than the closed-form atan2 decomposition this
-        replaces (which was structurally wrong, not just a formula typo)."""
+        orientation of target_pose.
+        
+        """
     
         self.move_to_pose({'joint_head_pan': 0.0, 'joint_head_tilt': 0.0}, blocking=True)
         self.wait_until_settled(['joint_head_pan', 'joint_head_tilt'])
@@ -829,9 +791,6 @@ class MoveJoints(HelloNode):
         map_to_base_rot = R.from_quat([q_base.x, q_base.y, q_base.z, q_base.w])
         desired_forward_base = map_to_base_rot.apply(desired_forward_map)
     
-        # Joint limits from the real URDF (radians) -- head_pan [-3.9, 1.5],
-        # head_tilt [-1.53, 0.79]. If your ROS params declare tighter soft
-        # limits than the URDF's hard limits, use those instead here.
         pan_limits = (-3.9, 1.5)
         tilt_limits = (-1.53, 0.79)
     
@@ -1337,29 +1296,6 @@ class MoveJoints(HelloNode):
                 self.capture_frame(pose_name, camera='d435')
 
             self.get_logger().info('Completed d435 camera poses')
-            # capture smaller images with the d405
-
-            # Send lift to various positions
-            # make an if statement here to determine if d405 is used
-            # for idx, cp in enumerate(self.d405_lifts):
-            #     self.camera_capture_pose(cp, camera='d405', joint='joint_lift')
-            #     self.wait_until_settled(['joint_lift'])
-            #     pose_name = f'wp{wp_idx}_d405_pose{idx}'
-            #     self.capture_frame(pose_name, camera='d405')
-
-            #     # Within each lift position, yaw and pitch the gripper
-            #     for yaw_idx, yaw_pose in enumerate(self.d405_yaws):
-            #         self.camera_capture_pose(yaw_pose, camera='d405', joint='joint_wrist_yaw')
-            #         self.wait_until_settled((['joint_wrist_yaw']))
-            #         pose_name = f'wp{wp_idx}_d405_pose{idx}_yaw_{yaw_idx}'
-            #         self.capture_frame(pose_name, camera='d405')
-
-            #         # Within each yaw, pitch the gripper 
-            #         for p_idx, p_pose, in enumerate(self.d405_tilts):
-            #             self.camera_capture_pose(p_pose, camera='d405', joint='joint_wrist_pitch')
-            #             self.wait_until_settled((['joint_wrist_pitch']))
-            #             pose_name = f'wp{wp_idx}_d405_pose{idx}_yaw_{yaw_idx}_pitch_{p_idx}'
-            #             self.capture_frame(pose_name, camera='d405')
 
         self.get_logger().info('Completed image captures!')
 

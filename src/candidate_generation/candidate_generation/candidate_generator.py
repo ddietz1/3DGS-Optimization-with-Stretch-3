@@ -20,8 +20,8 @@ from datetime import datetime
 
 def rpy_to_quaternion(roll, pitch, yaw):
     """Convert roll/pitch/yaw (radians) to a quaternion (x, y, z, w).
-    Verified correct against known single-axis cases before trusting it
-    in the full conversion pipeline below."""
+    
+    """
     cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
     cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
     cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
@@ -34,9 +34,7 @@ def rpy_to_quaternion(roll, pitch, yaw):
 
 
 def quat_to_rotmat(qx, qy, qz, qw):
-    """MUST exactly match build_transforms_from_poses.py's version on the
-    GPU side -- deliberate duplicate, not an import, since this runs on
-    the robot."""
+
     n = qx * qx + qy * qy + qz * qz + qw * qw
     if n < 1e-8:
         return np.eye(3)
@@ -52,10 +50,9 @@ def quat_to_rotmat(qx, qy, qz, qw):
 
 
 def rotmat_to_quat(R: np.ndarray):
-    """Shepperd's method -- standard, numerically stable rotation matrix
-    to quaternion conversion. Verified round-trip-correct against
-    quat_to_rotmat to ~1e-16 across 1000 random rotations earlier this
-    session."""
+    """Shepperd's method.
+    
+    """
     trace = R[0, 0] + R[1, 1] + R[2, 2]
     if trace > 0:
         s = 0.5 / np.sqrt(trace + 1.0)
@@ -84,19 +81,7 @@ def rotmat_to_quat(R: np.ndarray):
     return float(x), float(y), float(z), float(w)
 
 def direction_to_ros_quaternion(yaw: float, pitch: float):
-    """Builds a quaternion whose LOCAL Z axis (matching
-    camera_color_optical_frame's own forward convention) points toward
-    (yaw, pitch) directly, so it's correctly interpreted by everything
-    downstream (which treats candidate poses identically to real
-    camera_color_optical_frame TF orientations).
- 
-    yaw: azimuth in the map XY-plane, standard atan2(y,x) convention
-         (matches everywhere else in this project)
-    pitch: elevation, positive = tilted up (more +Z)
- 
-    Returns (qx, qy, qz, qw), same signature as rpy_to_quaternion so it's
-    a drop-in replacement at the call site.
-    """
+
     direction = np.array([
         np.cos(pitch) * np.cos(yaw),
         np.cos(pitch) * np.sin(yaw),
@@ -118,12 +103,7 @@ ROS_TO_NERFSTUDIO_FLIP = np.diag([1.0, -1.0, -1.0, 1.0])
 
 
 def pose_to_nerfstudio_c2w_3x4(pose: Pose) -> list:
-    """Converts a map-frame geometry_msgs/Pose into the SAME
-    camera-to-world convention Model B's training cameras use. Returns a
-    3x4 nested list -- verified this exact shape against the real
-    viewpoint_scoring.py's c2w_to_viewmat(), and the full rpy->quaternion->
-    this pipeline against 20 random samples plus a real --reuse-candidates
-    parse before shipping this."""
+
     q = pose.orientation
     c2w = np.eye(4)
     c2w[:3, :3] = quat_to_rotmat(q.x, q.y, q.z, q.w)
@@ -152,34 +132,17 @@ class CandidateGenerator(Node):
         # Path length feasibility gating
         self.max_path_length = 5.0
         self.max_length_ratio = 2.5
-        # NavFn's own tolerance (planner_server.GridBased.tolerance: 0.5 in
-        # nav2_params.yaml) lets it silently substitute the nearest reachable
-        # point when the literal goal is walled off/blocked, and reports
-        # success -- this must be tighter than that to catch it.
+
         self.max_goal_endpoint_gap = 0.15
 
-        # FIXED: was "~/stretch_user/nbv_candidates/Jul-30_dataset_4/" --
-        # did not match gpu_candidate_puller.py's ROBOT_CANDIDATES_DIR
-        # ("~/stretch_user/candidates"), so the GPU-side puller would never
-        # have found anything written here, even with the format fixed below.
         self.output_dir = os.path.expanduser("~/stretch_user/candidates/")
         os.makedirs(self.output_dir, exist_ok=True)
 
         # TF for odom -> map conversion (candidates come out of the local
-        # costmap, which is published in odom frame -- must be converted
-        # to map frame here, on the robot, via a live TF tree)
+        # costmap, which is published in odom frame
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # Nav2 planner access for feasibility checks.
-        # FIXED: distinct node_name (MoveJoints also constructs a
-        # BasicNavigator with the default name -- now that both nodes
-        # launch concurrently, this was a real, live name collision, not
-        # just a theoretical one) and waitUntilNav2Active() (MoveJoints
-        # already blocks on this before doing anything; this node never
-        # did, meaning it could start querying getPath() before Nav2's
-        # planner server exists -- caught by the blanket except below and
-        # silently returning False for every candidate during that window).
         self.navigator = BasicNavigator(node_name='candidate_generator_navigator')
         self.navigator.waitUntilNav2Active()
 
@@ -243,8 +206,8 @@ class CandidateGenerator(Node):
 
     def check_pose_feasible(self, goal_pose_map: Pose) -> bool:
         """Queries Nav2's global planner for a valid path to goal_pose_map.
-        A free costmap cell alone doesn't guarantee the robot's footprint
-        clears nearby obstacles or that a connected path exists at all."""
+        
+        """
 
         try:
             start = PoseStamped()
@@ -264,11 +227,6 @@ class CandidateGenerator(Node):
             if path is None or len(path.poses) == 0:
                 return False
 
-            # NEW: NavFn's own tolerance (planner_server.GridBased.tolerance:
-            # 0.5) lets it silently substitute the nearest reachable point
-            # when the literal goal is walled off/blocked, which then looks
-            # like a short, valid path even though the requested goal itself
-            # is unreachable -- catch that before trusting length/ratio.
             last_pose = path.poses[-1].pose.position
             goal_gap = math.hypot(
                 goal_pose_map.position.x - last_pose.x,
@@ -334,10 +292,6 @@ class CandidateGenerator(Node):
             gy, gx = cell
             x, y = self.grid_to_world(gx, gy)
 
-            # Position-only probe pose, checked ONCE per (x, y) before
-            # generating the full 6DOF pose -- orientation doesn't affect
-            # whether a path to this position exists, and per-pose checks
-            # would be too expensive inside a timer callback.
             probe_pose = Pose()
             probe_pose.position.x = x
             probe_pose.position.y = y
@@ -373,13 +327,6 @@ class CandidateGenerator(Node):
 
             candidates.append(pose_map)
 
-            # FIXED: was a nested {"position": {x,y,z}, "orientation": {x,y,z,w},
-            # "rpy": {...}} dict inside a top-level {"candidates": [...]}
-            # wrapper -- viewpoint_scoring.py's --reuse-candidates does
-            # json.load(f) then saved[0], expecting a flat LIST. A dict there
-            # raises KeyError: 0 immediately. Now matches its actual format:
-            # flat list, each entry with "position" (plain [x,y,z]) and
-            # "transform_matrix" (3x4, nerfstudio camera convention).
             candidate_records.append({
                 "position": [pose_map.position.x, pose_map.position.y, pose_map.position.z],
                 "transform_matrix": pose_to_nerfstudio_c2w_3x4(pose_map),
@@ -407,8 +354,8 @@ class CandidateGenerator(Node):
 
     def save_candidates(self, candidate_records):
         """Write this batch of candidate poses to a timestamped JSON file.
-        FIXED: writes candidate_records directly as a flat list -- no more
-        top-level {"timestamp", "frame_id", "candidates"} wrapper."""
+        
+        """
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filepath = os.path.join(self.output_dir, f"candidates_{timestamp}.json")
