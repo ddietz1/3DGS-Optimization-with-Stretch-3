@@ -450,47 +450,6 @@ class MoveJoints(HelloNode):
         # No rotate_base(pi) needed -- base_yaw was solved to already face
         # the right direction, not left to chance and patched after the fact.
 
-        # Nav2's SimpleGoalChecker (xy_goal_tolerance=0.25m, see
-        # stretch_nav2/config/nav2_params.yaml) reports SUCCEEDED well outside
-        # the precision candidate-pose scoring needs -- confirmed via a real
-        # capture landing ~0.39m from its intended candidate pose, entirely
-        # within that tolerance. Read back the ACTUAL achieved base position
-        # and re-drive if the residual is still too large, so the camera
-        # ends up close enough to the candidate pose that Shannon-MI scoring
-        # treats this as having genuinely observed from there.
-        max_base_position_error = 0.05  # meters
-        max_reposition_attempts = 2
-        for attempt in range(max_reposition_attempts):
-            try:
-                achieved_tf = self.tf_buffer.lookup_transform(
-                    'map', 'base_link', rclpy.time.Time(),
-                    timeout=rclpy.duration.Duration(seconds=1.0))
-            except Exception as e:
-                self.get_logger().warn(f'Could not read back achieved base pose: {e}')
-                break
-
-            dx = base_pose.pose.position.x - achieved_tf.transform.translation.x
-            dy = base_pose.pose.position.y - achieved_tf.transform.translation.y
-            error = sqrt(dx ** 2 + dy ** 2)
-            self.get_logger().info(
-                f'Base position error after nav: {error:.3f}m '
-                f'(attempt {attempt + 1}/{max_reposition_attempts})')
-            if error <= max_base_position_error:
-                break
-
-            self.navigator.goToPose(base_pose)
-            while not self.navigator.isTaskComplete():
-                time.sleep(0.2)
-            if self.navigator.getResult() != TaskResult.SUCCEEDED:
-                self.get_logger().warn('Reposition attempt failed to complete')
-                break
-            time.sleep(0.5)
-        else:
-            self.get_logger().warn(
-                f'Could not converge base position within {max_base_position_error}m '
-                f'after {max_reposition_attempts} attempts -- capturing anyway, but this '
-                f'candidate pose likely will not resolve its scored uncertainty.')
-
         # 2. Fine-tune pan/tilt for the exact final orientation match.
         pan, tilt = self.compute_d435_pan_tilt_for_orientation(test_pose)
         self.get_logger().info(f'DEBUG: computed pan={degrees(pan):.2f} tilt={degrees(tilt):.2f}')
@@ -1585,7 +1544,7 @@ class MoveJoints(HelloNode):
 
 def main(args=None):
     node = MoveJoints()
-    # node.follow_waypoints()
+    node.follow_waypoints()
     open(os.path.join(node.capture_dir, 'DONE'), 'w').close()  # signals gpu_main_loop.py the initial batch is ready
     node.new_thread.join()
     node.destroy_node()

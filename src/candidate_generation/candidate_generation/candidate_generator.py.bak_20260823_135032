@@ -152,11 +152,6 @@ class CandidateGenerator(Node):
         # Path length feasibility gating
         self.max_path_length = 5.0
         self.max_length_ratio = 2.5
-        # NavFn's own tolerance (planner_server.GridBased.tolerance: 0.5 in
-        # nav2_params.yaml) lets it silently substitute the nearest reachable
-        # point when the literal goal is walled off/blocked, and reports
-        # success -- this must be tighter than that to catch it.
-        self.max_goal_endpoint_gap = 0.15
 
         # FIXED: was "~/stretch_user/nbv_candidates/Jul-30_dataset_4/" --
         # did not match gpu_candidate_puller.py's ROBOT_CANDIDATES_DIR
@@ -263,25 +258,7 @@ class CandidateGenerator(Node):
             path = self.navigator.getPath(start, goal)
             if path is None or len(path.poses) == 0:
                 return False
-
-            # NEW: NavFn's own tolerance (planner_server.GridBased.tolerance:
-            # 0.5) lets it silently substitute the nearest reachable point
-            # when the literal goal is walled off/blocked, which then looks
-            # like a short, valid path even though the requested goal itself
-            # is unreachable -- catch that before trusting length/ratio.
-            last_pose = path.poses[-1].pose.position
-            goal_gap = math.hypot(
-                goal_pose_map.position.x - last_pose.x,
-                goal_pose_map.position.y - last_pose.y,
-            )
-            if goal_gap > self.max_goal_endpoint_gap:
-                self.get_logger().info(
-                    f'Rejected candidate: planner path ends {goal_gap:.2f}m short of '
-                    f'the requested goal (tolerance={self.max_goal_endpoint_gap}m) -- '
-                    f'likely walled off, NavFn substituted a nearby reachable point'
-                )
-                return False
-
+ 
             path_length = 0.0
             for i in range(1, len(path.poses)):
                 p0 = path.poses[i - 1].pose.position
