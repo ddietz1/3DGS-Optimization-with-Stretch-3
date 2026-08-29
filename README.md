@@ -130,6 +130,7 @@ https://github.com/user-attachments/assets/c097206c-a71c-4437-8668-94fcb764495a
 ### Graph showing PSNR (Peak Signal to Noise Ratio) for an optimized run versus a run that uses the same number of random images
 <img width="1050" height="750" alt="held_out_view_quality" src="https://github.com/user-attachments/assets/43f5f3b0-30d4-4a24-b66c-631ccc834009" />
 
-## Future Work
-1. Streakiness caused by imperfect poses from the amcl
-2. Only using the mounted camera so fixed height
+## Limitations and Future Work
+The initial model is contains more prominent streaks and floater gaussian artifacts that it would using COLMAP(NerfStudio's default for building the transforms.json). This is due to the inherent uncertainty in the XY position of the robot where it captures the initial images for the model. To counteract that, the capture_frame() method used in the robot_control package checks the AMCL pose covariance and ensures that the uncertainty in XY position is below a threshold, but the uncertainty in XY position still causes small irregularities when creating the transforms.json directly from the camera poses. 
+
+The Stretch 3 has two cameras(a fixed height, mounted d435 and a d405 mounted on the gripper arm). Due to time limitations, this system only uses the mounted d435 camera which brings some limitations. The generated candidate poses are thus fixed to a certain height which limits the kinds of poses that are scored. It entirely possible that higher scoring poses exist in the initial model that are at different heights than the mounted camera can reach and these poses are ignored by the current system. Future work in this project would include allow for full 6 DOF pose freedom for generated candidate poses and enable the system to capture potentially higher scoring poses using the gripper mounted camera.
