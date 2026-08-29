@@ -22,7 +22,7 @@ This repository consists of three ROS2 packages plus a set of standalone Python 
 Run on a separate GPU workstation (needs a CUDA-capable GPU, NerfStudio + gsplat installed):
 
 * `gpu_main_loop.py` - Orchestrates the entire pipeline end to end: waits for the robot's initial waypoint capture, builds the seed dataset, trains the initial model, then repeatedly scores candidates, sends the top pose(s) back to the robot, waits for the resulting new capture, and resume-trains the model. Pulls/pushes data to and from the Stretch 3 over `scp`.
-* `gpu_candidate_puller.py` - Runs continuously in the background (started automatically by `gpu_main_loop.py`); pulls newly-written candidate JSON files from the Stretch 3's `~/stretch_user/candidates/` directory down to the GPU.
+* `gpu_candidate_puller.py` - Runs continuously in the background (started automatically by `gpu_main_loop.py`); pulls newly-written candidate JSON files from the Stretch 3's `~/stretch_user/candidates/` directory to the GPU.
 * `score_and_return_top_candidates.py` - Scores the currently pulled candidate pool against the latest trained checkpoint (via `viewpoint_scoring.py`), converts the top-N poses back into ROS-native (map-frame position + quaternion) form, and pushes them to the robot's `~/stretch_user/scored_candidates/`.
 * `viewpoint_scoring.py` - Plain-PyTorch reimplementation of Shannon Mutual Information viewpoint scoring, based on the GauSS-MI approach (see Citations). Maintains a per-Gaussian-primitive "reliability" tensor updated from photometric residuals over training views, and scores candidate poses by the expected information gain of observing from there.
 * `build_transforms_from_poses.py` - Builds a `transforms.json` dataset directly from the robot's own AMCL/map-frame poses (rather than deriving camera poses via COLMAP, which is NerfStudio's usual approach), including initial point-cloud seeding from depth.
@@ -120,13 +120,16 @@ This project's Shannon-MI viewpoint scoring is a plain-PyTorch reimplementation 
 }
 
 # Demo Videos
-## Spliced video of the robot running alongside the robot running in SIM collecting data
+## Data Collection
 [video link]
 
-## Video showing a high scoring pose being slowly rendered better after a single round
+## Updated rendering of a high scoring pose
 https://github.com/user-attachments/assets/c097206c-a71c-4437-8668-94fcb764495a
 
 ## Data
-### Graph showing PSNR (Peak Signal to Noise Ratio) for an optimized run versus a run that uses the same number of random images in one shot
+### Graph showing PSNR (Peak Signal to Noise Ratio) for an optimized run versus a run that uses the same number of random images
 <img width="1050" height="750" alt="held_out_view_quality" src="https://github.com/user-attachments/assets/43f5f3b0-30d4-4a24-b66c-631ccc834009" />
 
+## Future Work
+1. Streakiness caused by imperfect poses from the amcl
+2. Only using the mounted camera so fixed height
