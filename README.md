@@ -112,12 +112,20 @@ This polls the robot's capture directory until a `DONE` marker appears, pulls th
 
 ## Citations
 This project's Shannon-MI viewpoint scoring is a plain-PyTorch reimplementation based on the GauSS-MI approach.
+> Y. Xie, Y. Cai, Y. Zhang, L. Yang, and J. Pan, "GauSS-MI: Gaussian Splatting Shannon Mutual Information for Active 3D Reconstruction," *arXiv preprint arXiv:2504.21067*, 2025.
+
+<details>
+<summary>BibTeX</summary>
+
+```bibtex
 @article{xie2025gaussmi,
   title={GauSS-MI: Gaussian Splatting Shannon Mutual Information for Active 3D Reconstruction},
   author={Xie, Yuhan and Cai, Yixi and Zhang, Yinqiang and Yang, Lei and Pan, Jia},
   journal={arXiv preprint arXiv:2504.21067},
   year={2025}
 }
+```
+</details>
 
 # Demo Videos
 
