@@ -133,6 +133,7 @@ https://github.com/user-attachments/assets/4734ea2d-501a-4d96-9bd4-d07b42582b60
 ### PSNR (Peak Signal to Noise Ratio) for an optimized run versus a run that uses the same number of random images
 <img width="1050" height="750" alt="held_out_view_quality" src="https://github.com/user-attachments/assets/43f5f3b0-30d4-4a24-b66c-631ccc834009" />
 
+This graph shows the mean PSNR values for 3 poses not contained in the dataset during the run. The mean PSNR is consistently higher through the course of the run when the SMI scoring mechanism is used to determine the Next Best View versus random selection, lending credence to the scoring mechanism as a useful method for model optimization. 
 ## Limitations and Future Work
 The initial model contains more prominent streaks and floater gaussian artifacts that it would using COLMAP(NerfStudio's default for building the transforms.json). This is due to the inherent uncertainty in the XY position of the robot when it captures the initial images for the model. To counteract this, the capture_frame() method used in the robot_control package checks the AMCL pose covariance and ensures that the uncertainty in XY position is below a threshold, but the uncertainty still causes small irregularities when creating the transforms.json directly from the camera poses. 
 
